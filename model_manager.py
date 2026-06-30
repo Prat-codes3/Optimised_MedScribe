@@ -249,7 +249,6 @@ class ModelManager:
         Python and CUDA to free the VRAM/RAM.
         """
         if self._whisper_model is not None:
-            del self._whisper_model
             self._whisper_model = None
             self._loaded_whisper_size = None
 
