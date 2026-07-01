@@ -38,8 +38,11 @@ USAGE EXAMPLES:
     # Override model and device
     python main.py --file recording.wav --model large-v3 --device cuda
 
-    # Live transcription (Phase 2 — to be added later)
+    # Live transcription from microphone
     python main.py --live
+
+    # Live with custom output file
+    python main.py --live --live-output session.txt
 """
 
 import argparse
@@ -72,12 +75,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  python main.py --file consult.wav\n"
             "  python main.py --file consult.wav --diarize --output json\n"
             "  python main.py --dir D:/recordings/ --diarize\n"
+            "  python main.py --live\n"
+            "  python main.py --live --live-output my_session.txt\n"
         ),
     )
 
     # ── Input Source (mutually exclusive) ──────────────────────────────
-    # The user must provide EITHER --file OR --dir, but not both.
-    # In Phase 2, --live will be added as a third option.
+    # The user must provide EXACTLY ONE of --file, --dir, or --live.
     input_group = parser.add_mutually_exclusive_group(required=True)
 
     input_group.add_argument(
@@ -90,6 +94,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dir", "-d",
         type=str,
         help="Path to a directory of audio files to batch-process.",
+    )
+
+    input_group.add_argument(
+        "--live",
+        action="store_true",
+        default=False,
+        help="Start real-time microphone transcription.",
     )
 
     # ── Model Settings ────────────────────────────────────────────────
@@ -154,6 +165,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number of 30s audio windows processed per GPU call. Default: 8",
     )
 
+    # ── Live-Specific Settings ────────────────────────────────────────
+    parser.add_argument(
+        "--live-output",
+        type=str,
+        default=None,
+        help="Output file path for the live session transcript.",
+    )
+
+    parser.add_argument(
+        "--no-vad",
+        action="store_true",
+        default=False,
+        help="Disable VAD in live mode (not recommended — increases hallucinations).",
+    )
+
     return parser
 
 
@@ -202,6 +228,20 @@ def apply_cli_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfi
     if args.batch_size is not None:
         config.batch_size = args.batch_size
 
+    # ── Live-specific overrides ───────────────────────────────────
+    if hasattr(args, 'live') and args.live:
+        # In live mode, use the smaller live_model for low latency
+        # UNLESS the user explicitly passed --model to override it.
+        if args.model is None:
+            config.model_size = config.live_model
+
+        # Use greedy decoding (beam_size=1) for speed unless overridden
+        if args.beam_size is None:
+            config.beam_size = config.live_beam_size
+
+    if hasattr(args, 'no_vad') and args.no_vad:
+        config.use_vad = False
+
     return config
 
 
@@ -219,26 +259,39 @@ def main():
     # ── Step 3: Print the active configuration ────────────────────────
     print(config.summary())
 
-    # ── Step 4: Create and run the pipeline ───────────────────────────
-    pipeline = BatchPipeline(config)
+    # ── Step 4: Create and run the appropriate pipeline ────────────────
+    if args.live:
+        # ── Live Mode ─────────────────────────────────────────────
+        from pipelines.live_pipeline import LivePipeline
 
-    if args.file:
-        # Single file mode
-        result = pipeline.process_file(args.file)
+        pipeline = LivePipeline(config)
 
-        # Exit with error code if processing failed
-        if not result["success"]:
-            sys.exit(1)
+        # start_stream() is a generator — it yields transcribed lines
+        # as they happen in real-time.  We print each line as it arrives.
+        for line in pipeline.start_stream(output_file=args.live_output):
+            print(line)
 
-    elif args.dir:
-        # Directory batch mode
-        results = pipeline.process_directory(args.dir)
+    else:
+        # ── Batch Mode (--file or --dir) ──────────────────────────
+        pipeline = BatchPipeline(config)
 
-        # Exit with error code if ANY file failed
-        failed = [r for r in results if not r["success"]]
-        if failed:
-            print(f"\n{len(failed)} file(s) had errors.")
-            sys.exit(1)
+        if args.file:
+            # Single file mode
+            result = pipeline.process_file(args.file)
+
+            # Exit with error code if processing failed
+            if not result["success"]:
+                sys.exit(1)
+
+        elif args.dir:
+            # Directory batch mode
+            results = pipeline.process_directory(args.dir)
+
+            # Exit with error code if ANY file failed
+            failed = [r for r in results if not r["success"]]
+            if failed:
+                print(f"\n{len(failed)} file(s) had errors.")
+                sys.exit(1)
 
 
 if __name__ == "__main__":
